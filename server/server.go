@@ -13,15 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cenk/backoff"
 	"github.com/gorilla/mux"
-	"github.com/jtblin/kube2iam"
 	"github.com/jtblin/kube2iam/iam"
 	"github.com/jtblin/kube2iam/k8s"
-	"github.com/jtblin/kube2iam/mappings"
 	"github.com/jtblin/kube2iam/metrics"
 	log "github.com/sirupsen/logrus"
-	"k8s.io/client-go/tools/cache"
 )
 
 const (
@@ -78,7 +74,6 @@ type Server struct {
 	Version                    bool
 	iam                        *iam.Client
 	k8s                        *k8s.Client
-	roleMapper                 *mappings.RoleMapper
 	BackoffMaxElapsedTime      time.Duration
 	BackoffMaxInterval         time.Duration
 	InstanceID                 string
@@ -168,46 +163,6 @@ func parseRemoteAddr(addr string) string {
 	return hostname
 }
 
-func (s *Server) getRoleMapping(IP string) (*mappings.RoleMappingResult, error) {
-	var roleMapping *mappings.RoleMappingResult
-	var err error
-	operation := func() error {
-		roleMapping, err = s.roleMapper.GetRoleMapping(IP)
-		return err
-	}
-
-	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.MaxInterval = s.BackoffMaxInterval
-	expBackoff.MaxElapsedTime = s.BackoffMaxElapsedTime
-
-	err = backoff.Retry(operation, expBackoff)
-	if err != nil {
-		return nil, err
-	}
-
-	return roleMapping, nil
-}
-
-func (s *Server) getExternalIDMapping(IP string) (string, error) {
-	var externalID string
-	var err error
-	operation := func() error {
-		externalID, err = s.roleMapper.GetExternalIDMapping(IP)
-		return err
-	}
-
-	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.MaxInterval = s.BackoffMaxInterval
-	expBackoff.MaxElapsedTime = s.BackoffMaxElapsedTime
-
-	err = backoff.Retry(operation, expBackoff)
-	if err != nil {
-		return "", err
-	}
-
-	return externalID, nil
-}
-
 func (s *Server) beginPollHealthcheck(interval time.Duration) {
 	if s.healthcheckTicker == nil {
 		s.doHealthcheck()
@@ -283,76 +238,25 @@ func (s *Server) healthHandler(logger *log.Entry, w http.ResponseWriter, r *http
 	}
 }
 
-func (s *Server) debugStoreHandler(logger *log.Entry, w http.ResponseWriter, r *http.Request) {
-	o, err := json.Marshal(s.roleMapper.DumpDebugInfo())
-	if err != nil {
-		log.Errorf("Error converting debug map to json: %+v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	write(logger, w, string(o))
-}
-
 func (s *Server) securityCredentialsHandler(logger *log.Entry, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Server", "EC2ws")
-	remoteIP := parseRemoteAddr(r.RemoteAddr)
-	roleMapping, err := s.getRoleMapping(remoteIP)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	// If a base ARN has been supplied and this is not cross-account then
-	// return a simple role-name, otherwise return the full ARN
-	if s.iam.BaseARN != "" && strings.HasPrefix(roleMapping.Role, s.iam.BaseARN) {
-		write(logger, w, strings.TrimPrefix(roleMapping.Role, s.iam.BaseARN))
-		return
-	}
-	write(logger, w, roleMapping.Role)
+	write(logger, w, s.DefaultIAMRole)
 }
 
 func (s *Server) roleHandler(logger *log.Entry, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Server", "EC2ws")
-	remoteIP := parseRemoteAddr(r.RemoteAddr)
 
-	roleMapping, err := s.getRoleMapping(remoteIP)
+	wantedRoleARN := s.iam.RoleARN(s.DefaultIAMRole)
+	credentials, err := s.iam.AssumeRole(wantedRoleARN, s.IAMRoleSessionTTL)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	externalID, err := s.getExternalIDMapping(remoteIP)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	roleLogger := logger.WithFields(log.Fields{
-		"pod.iam.role": roleMapping.Role,
-		"ns.name":      roleMapping.Namespace,
-	})
-
-	wantedRole := mux.Vars(r)["role"]
-	wantedRoleARN := s.iam.RoleARN(wantedRole)
-
-	if wantedRoleARN != roleMapping.Role {
-		roleLogger.WithField("params.iam.role", wantedRole).
-			Error("Invalid role: does not match annotated role")
-		http.Error(w, fmt.Sprintf("Invalid role %s", wantedRole), http.StatusForbidden)
-		return
-	}
-
-	credentials, err := s.iam.AssumeRole(wantedRoleARN, externalID, remoteIP, s.IAMRoleSessionTTL)
-	if err != nil {
-		roleLogger.Errorf("Error assuming role %+v", err)
+		logger.Errorf("Server.roleHandler: Error assuming role %+v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	roleLogger.Debugf("retrieved credentials from sts endpoint: %s", s.iam.Endpoint)
+	logger.Debugf("retrieved credentials from sts endpoint: %s", s.iam.Endpoint)
 
 	if err := json.NewEncoder(w).Encode(credentials); err != nil {
-		roleLogger.Errorf("Error sending json %+v", err)
+		logger.Errorf("Error sending json %+v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -378,37 +282,16 @@ func (s *Server) Run(host, token, nodeName string, insecure bool) error {
 	s.k8s = k
 	s.iam = iam.NewClient(s.BaseRoleARN, s.UseRegionalStsEndpoint)
 	log.Debugln("Caches have been synced.  Proceeding with server.")
-	s.roleMapper = mappings.NewRoleMapper(s.IAMRoleKey, s.IAMExternalID, s.DefaultIAMRole, s.NamespaceRestriction, s.NamespaceKey, s.iam, s.k8s, s.NamespaceRestrictionFormat)
-	log.Debugf("Starting pod and namespace sync jobs with %s resync period", s.CacheResyncPeriod.String())
-	podSynched := s.k8s.WatchForPods(kube2iam.NewPodHandler(s.IAMRoleKey), s.CacheResyncPeriod)
-	namespaceSynched := s.k8s.WatchForNamespaces(kube2iam.NewNamespaceHandler(s.NamespaceKey), s.CacheResyncPeriod)
-
-	synced := false
-	for i := 0; i < defaultCacheSyncAttempts && !synced; i++ {
-		synced = cache.WaitForCacheSync(nil, podSynched, namespaceSynched)
-	}
-
-	if !synced {
-		log.Fatalf("Attempted to wait for caches to be synced for %d however it is not done.  Giving up.", defaultCacheSyncAttempts)
-	} else {
-		log.Debugln("Caches have been synced.  Proceeding with server.")
-	}
 
 	// Begin healthchecking
 	s.beginPollHealthcheck(healthcheckInterval)
 
 	r := mux.NewRouter()
-	securityHandler := newAppHandler("securityCredentialsHandler", s.securityCredentialsHandler)
 
-	if s.Debug {
-		// This is a potential security risk if enabled in some clusters, hence the flag
-		r.Handle("/debug/store", newAppHandler("debugStoreHandler", s.debugStoreHandler))
-	}
+	securityHandler := newAppHandler("securityCredentialsHandler", s.securityCredentialsHandler)
 	r.Handle("/{version}/meta-data/iam/security-credentials", securityHandler)
 	r.Handle("/{version}/meta-data/iam/security-credentials/", securityHandler)
-	r.Handle(
-		"/{version}/meta-data/iam/security-credentials/{role:.*}",
-		newAppHandler("roleHandler", s.roleHandler))
+	r.Handle("/{version}/meta-data/iam/security-credentials/{role:.*}", newAppHandler("roleHandler", s.roleHandler))
 	r.Handle("/healthz", newAppHandler("healthHandler", s.healthHandler))
 
 	if s.MetricsPort == s.AppPort {

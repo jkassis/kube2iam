@@ -70,9 +70,9 @@ func GetInstanceIAMRole() (string, error) {
 	return iamRole, nil
 }
 
-func sessionName(roleARN, remoteIP string) string {
+func sessionName(roleARN string) string {
 	idx := strings.LastIndex(roleARN, "/")
-	name := fmt.Sprintf("%s-%s", getHash(remoteIP), roleARN[idx+1:])
+	name := fmt.Sprintf("%s", roleARN[idx+1:])
 	return fmt.Sprintf("%.[2]*[1]s", name, maxSessNameLength)
 }
 
@@ -126,7 +126,7 @@ func (iam *Client) EndpointFor(service, region string, optFns ...func(*endpoints
 }
 
 // AssumeRole returns an IAM role Credentials using AWS STS.
-func (iam *Client) AssumeRole(roleARN, externalID string, remoteIP string, sessionTTL time.Duration) (*Credentials, error) {
+func (iam *Client) AssumeRole(roleARN string, sessionTTL time.Duration) (*Credentials, error) {
 	hitCache := true
 	item, err := cache.Fetch(roleARN, sessionTTL, func() (interface{}, error) {
 		hitCache = false
@@ -152,12 +152,9 @@ func (iam *Client) AssumeRole(roleARN, externalID string, remoteIP string, sessi
 		assumeRoleInput := sts.AssumeRoleInput{
 			DurationSeconds: aws.Int64(int64(sessionTTL.Seconds() * 2)),
 			RoleArn:         aws.String(roleARN),
-			RoleSessionName: aws.String(sessionName(roleARN, remoteIP)),
+			RoleSessionName: aws.String(sessionName(roleARN)),
 		}
 		// Only inject the externalID if one was provided with the request
-		if externalID != "" {
-			assumeRoleInput.SetExternalId(externalID)
-		}
 		resp, err := svc.AssumeRole(&assumeRoleInput)
 		if err != nil {
 			return nil, err

@@ -2,14 +2,11 @@ package k8s
 
 import (
 	"fmt"
-	"time"
 
-	"github.com/jtblin/kube2iam"
 	"github.com/jtblin/kube2iam/metrics"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	selector "k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -40,35 +37,9 @@ func (k8s *Client) createPodLW() *cache.ListWatch {
 	return cache.NewListWatchFromClient(k8s.CoreV1().RESTClient(), "pods", v1.NamespaceAll, fieldSelector)
 }
 
-// WatchForPods watches for pod changes.
-func (k8s *Client) WatchForPods(podEventLogger cache.ResourceEventHandler, resyncPeriod time.Duration) cache.InformerSynced {
-	k8s.podIndexer, k8s.podController = cache.NewIndexerInformer(
-		k8s.createPodLW(),
-		&v1.Pod{},
-		resyncPeriod,
-		podEventLogger,
-		cache.Indexers{podIPIndexName: kube2iam.PodIPIndexFunc},
-	)
-	go k8s.podController.Run(wait.NeverStop)
-	return k8s.podController.HasSynced
-}
-
 // returns a cache.ListWatch of namespaces.
 func (k8s *Client) createNamespaceLW() *cache.ListWatch {
 	return cache.NewListWatchFromClient(k8s.CoreV1().RESTClient(), "namespaces", v1.NamespaceAll, selector.Everything())
-}
-
-// WatchForNamespaces watches for namespaces changes.
-func (k8s *Client) WatchForNamespaces(nsEventLogger cache.ResourceEventHandler, resyncPeriod time.Duration) cache.InformerSynced {
-	k8s.namespaceIndexer, k8s.namespaceController = cache.NewIndexerInformer(
-		k8s.createNamespaceLW(),
-		&v1.Namespace{},
-		resyncPeriod,
-		nsEventLogger,
-		cache.Indexers{namespaceIndexName: kube2iam.NamespaceIndexFunc},
-	)
-	go k8s.namespaceController.Run(wait.NeverStop)
-	return k8s.namespaceController.HasSynced
 }
 
 // ListPodIPs returns the underlying set of pods being managed/indexed
@@ -95,7 +66,7 @@ func (k8s *Client) PodByIP(IP string) (*v1.Pod, error) {
 
 	if len(pods) == 0 {
 		metrics.PodNotFoundInCache.Inc()
-		return nil, fmt.Errorf("pod with specificed IP not found")
+		return nil, fmt.Errorf("pod with specified %s IP not found", IP)
 	}
 
 	if len(pods) == 1 {
